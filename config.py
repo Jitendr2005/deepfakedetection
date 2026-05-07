@@ -1,5 +1,6 @@
 """
-Configuration file for Deepfake Detection Project (Transformers + Images Only)
+Configuration file for Deepfake Detection Project
+Supports both Transformer and CNN architectures
 """
 import os
 import torch
@@ -15,27 +16,29 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 for dir_path in [DATA_DIR, MODELS_DIR, RESULTS_DIR]:
     dir_path.mkdir(exist_ok=True)
 
-# Model configuration - Using Transformers
+# Model configuration
 MODEL_CONFIG = {
-    "model_name": "vit_base",  # Options: vit_base, vit_large, deit_base, swin_base
+    "model_name": "efficientnet_b0",  # Default model
+    "available_models": ["vit_base", "efficientnet_b0", "resnet50", "swin_base"],
     "input_size": 224,
     "num_classes": 2,  # Real vs Fake
     "pretrained": True,
     "dropout": 0.5
 }
 
-# Training configuration
+# Training configuration - Model specific defaults
 TRAIN_CONFIG = {
-    "batch_size": 16,  # Smaller batch size for transformers
+    "batch_size": 16,
     "num_epochs": 50,
-    "learning_rate": 2e-5,  # Lower learning rate for transformers
+    "learning_rate": 2e-5,  # Default for transformers
+    "cnn_learning_rate": 1e-4,  # Default for CNNs
     "weight_decay": 1e-4,
-    "num_workers": 4,
+    "num_workers": 2,  # Reduced for local machine stability
     "pin_memory": True,
-    "accumulation_steps": 2,  # Gradient accumulation for effective larger batch
+    "accumulation_steps": 2,
     "early_stopping_patience": 10,
     "save_best_only": True,
-    "warmup_steps": 500  # Warmup steps for transformers
+    "warmup_steps": 500
 }
 
 # Data configuration - Images Only
@@ -63,5 +66,10 @@ DATASET_CONFIG = {
     }
 }
 
-# Device configuration
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Device configuration - Improved for Mac support
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"

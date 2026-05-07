@@ -1,5 +1,6 @@
 """
 Training script for Deepfake Detection
+Supports multiple model architectures
 """
 import torch
 import torch.nn as nn
@@ -10,6 +11,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import argparse
 
 from model import get_model
 from data_loader import create_dataloaders, split_dataset
@@ -19,38 +21,46 @@ from config import MODEL_CONFIG, TRAIN_CONFIG, DATA_CONFIG, MODELS_DIR, RESULTS_
 class Trainer:
     """Training class for deepfake detection"""
     
-    def __init__(self, model, train_loader, val_loader, device):
+    def __init__(self, model, model_name, train_loader, val_loader, device):
         self.model = model.to(device)
+        self.model_name = model_name
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        
+        # Determine if it's a transformer or CNN for scheduling/LR
+        self.is_transformer = "vit" in model_name or "deit" in model_name or "swin" in model_name
+        
+        # Set learning rate based on model type
+        lr = TRAIN_CONFIG["learning_rate"] if self.is_transformer else TRAIN_CONFIG["cnn_learning_rate"]
         
         # Loss and optimizer
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=TRAIN_CONFIG["learning_rate"],
+            lr=lr,
             weight_decay=TRAIN_CONFIG["weight_decay"]
         )
         
-        # Learning rate scheduler with warmup for transformers
-        from transformers import get_linear_schedule_with_warmup
-        num_training_steps = len(self.train_loader) * TRAIN_CONFIG["num_epochs"]
-        warmup_steps = TRAIN_CONFIG.get("warmup_steps", 500)
-        
-        self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        
-        # Also keep ReduceLROnPlateau for validation-based scheduling
+        # Schedulers
+        if self.is_transformer:
+            from transformers import get_linear_schedule_with_warmup
+            num_training_steps = len(self.train_loader) * TRAIN_CONFIG["num_epochs"]
+            warmup_steps = TRAIN_CONFIG.get("warmup_steps", 500)
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=num_training_steps
+            )
+        else:
+            self.scheduler = None
+
+        # Plateau scheduler for all models
         self.plateau_scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=5,
-            verbose=True
+            patience=5
         )
         
         # Training history
@@ -92,7 +102,8 @@ class Trainer:
             # Update weights every accumulation_steps
             if (step + 1) % accumulation_steps == 0:
                 self.optimizer.step()
-                self.scheduler.step()  # Step transformer scheduler
+                if self.scheduler:
+                    self.scheduler.step()
                 self.optimizer.zero_grad()
             
             # Statistics
@@ -131,28 +142,23 @@ class Trainer:
         
         epoch_loss = running_loss / len(self.val_loader)
         epoch_acc = accuracy_score(all_labels, all_preds)
-        epoch_precision = precision_score(all_labels, all_preds, average='weighted')
-        epoch_recall = recall_score(all_labels, all_preds, average='weighted')
         epoch_f1 = f1_score(all_labels, all_preds, average='weighted')
         
-        return epoch_loss, epoch_acc, epoch_f1, all_preds, all_labels
+        return epoch_loss, epoch_acc, epoch_f1
     
     def train(self, num_epochs):
         """Main training loop"""
         print(f"Starting training on {self.device}")
-        print(f"Model: {MODEL_CONFIG['model_name']}")
-        print(f"Training samples: {len(self.train_loader.dataset)}")
-        print(f"Validation samples: {len(self.val_loader.dataset)}")
+        print(f"Model Architecture: {self.model_name}")
         
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
-            print("-" * 50)
             
             # Train
             train_loss, train_acc = self.train_epoch()
             
             # Validate
-            val_loss, val_acc, val_f1, val_preds, val_labels = self.validate()
+            val_loss, val_acc, val_f1 = self.validate()
             
             # Update learning rate (plateau scheduler for validation-based adjustment)
             self.plateau_scheduler.step(val_loss)
@@ -173,14 +179,14 @@ class Trainer:
                 self.best_val_loss = val_loss
                 self.best_val_acc = val_acc
                 self.patience_counter = 0
-                self.save_model(f"best_model_epoch_{epoch+1}.pth")
-                print("✓ Saved best model")
+                self.save_model(f"best_{self.model_name}.pth")
+                print(f"✓ Saved best {self.model_name} model")
             else:
                 self.patience_counter += 1
             
             # Early stopping
             if self.patience_counter >= TRAIN_CONFIG["early_stopping_patience"]:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                print(f"\nEarly stopping triggered!")
                 break
         
         # Save training history
@@ -192,17 +198,16 @@ class Trainer:
     def save_model(self, filename):
         """Save model checkpoint"""
         checkpoint = {
+            'model_name': self.model_name,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
             'history': self.history,
-            'best_val_loss': self.best_val_loss,
             'best_val_acc': self.best_val_acc
         }
         torch.save(checkpoint, MODELS_DIR / filename)
     
     def save_history(self):
         """Save training history to JSON"""
-        history_file = RESULTS_DIR / "training_history.json"
+        history_file = RESULTS_DIR / f"history_{self.model_name}.json"
         with open(history_file, 'w') as f:
             json.dump(self.history, f, indent=2)
     
@@ -213,87 +218,87 @@ class Trainer:
         # Loss plot
         axes[0].plot(self.history['train_loss'], label='Train Loss')
         axes[0].plot(self.history['val_loss'], label='Val Loss')
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
-        axes[0].set_title('Training and Validation Loss')
+        axes[0].set_title(f'Loss - {self.model_name}')
         axes[0].legend()
-        axes[0].grid(True)
         
         # Accuracy plot
         axes[1].plot(self.history['train_acc'], label='Train Acc')
         axes[1].plot(self.history['val_acc'], label='Val Acc')
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Accuracy')
-        axes[1].set_title('Training and Validation Accuracy')
+        axes[1].set_title(f'Accuracy - {self.model_name}')
         axes[1].legend()
-        axes[1].grid(True)
         
-        plt.tight_layout()
-        plt.savefig(RESULTS_DIR / "training_history.png", dpi=300, bbox_inches='tight')
+        plt.savefig(RESULTS_DIR / f"history_{self.model_name}.png")
         plt.close()
 
-def load_data():
-    """Load and combine image datasets from multiple sources (images only, no videos)"""
+def load_data(limit=None):
+    """Load image datasets with lazy loading"""
     print("Loading image datasets...")
     all_paths = []
-    
-    # Load HuggingFace image datasets
+    hf_dataset = None
     try:
         hf_loader = HuggingFaceDataLoader()
-        # Use dataset name from config
         dataset_name = DATASET_CONFIG["huggingface"]["faceforensics"]["name"]
-        faceforensics_paths = hf_loader.load_faceforensics_dataset(
-            dataset_name,
-            split="train"
-        )
-        if faceforensics_paths:
-            all_paths.extend(faceforensics_paths)
-            print(f"Loaded {len(faceforensics_paths)} samples from {dataset_name}")
+        res = hf_loader.load_faceforensics_dataset(dataset_name, split="train", limit=limit)
+        if res:
+            all_paths, hf_dataset = res
+            print(f"Loaded metadata for {len(all_paths)} samples (Lazy Loading)")
     except Exception as e:
-        print(f"Warning: Could not load HuggingFace datasets: {e}")
-    
-    # If no data loaded
-    if not all_paths:
-        print("No datasets found. Please download datasets first.")
-        return None
-    
-    return all_paths
+        print(f"Warning: {e}")
+    return all_paths, hf_dataset
 
 def main():
     """Main training function"""
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(description="Train Deepfake Detection Model")
+    parser.add_argument("--model", type=str, default=MODEL_CONFIG["model_name"], help="Model architecture")
+    parser.add_argument("--epochs", type=int, default=TRAIN_CONFIG["num_epochs"], help="Number of epochs")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of samples for toy run")
+    parser.add_argument("--dry-run", action="store_true", help="Just check environment and exit")
+    args = parser.parse_args()
+
+    from config import DEVICE
+    device = torch.device(DEVICE)
     print(f"Using device: {device}")
     
-    # Load data
-    all_paths = load_data()
-    
-    if all_paths is None or len(all_paths) == 0:
-        print("\n" + "="*60)
-        print("IMPORTANT: No datasets found!")
-        print("Please download datasets using the download script first.")
-        print("See README.md for instructions on downloading datasets.")
-        print("="*60)
+    if args.dry_run:
+        print("Dry run successful! Environment is ready.")
+        import timm
+        import datasets
+        print(f"Timm version: {timm.__version__}")
+        print(f"Datasets version: {datasets.__version__}")
         return
+    
+    # Load data
+    all_paths, hf_dataset = load_data(limit=args.limit)
+    
+    if not all_paths:
+        print("No datasets found! Run download_datasets.py first.")
+        return
+    
+    # Apply limit for toy run
+    if args.limit:
+        print(f"Applying sample limit: {args.limit}")
+        import random
+        random.seed(42)  # For reproducibility during demo
+        random.shuffle(all_paths)
+        all_paths = all_paths[:args.limit]
     
     # Split dataset
     train_paths, val_paths, test_paths = split_dataset(
         all_paths,
+        hf_dataset=hf_dataset,
         train_split=DATA_CONFIG["train_split"],
         val_split=DATA_CONFIG["val_split"],
         test_split=DATA_CONFIG["test_split"]
     )
     
-    print(f"\nDataset splits:")
-    print(f"Train: {len(train_paths)} samples")
-    print(f"Val: {len(val_paths)} samples")
-    print(f"Test: {len(test_paths)} samples")
+    print(f"\nDataset splits: Train={len(train_paths)}, Val={len(val_paths)}")
     
     # Create data loaders
-    train_loader, val_loader, test_loader = create_dataloaders(
+    train_loader, val_loader, _ = create_dataloaders(
         train_paths,
         val_paths,
         test_paths,
+        hf_dataset=hf_dataset,
         batch_size=TRAIN_CONFIG["batch_size"],
         num_workers=TRAIN_CONFIG["num_workers"],
         input_size=MODEL_CONFIG["input_size"]
@@ -301,27 +306,17 @@ def main():
     
     # Create model
     model = get_model(
-        model_name=MODEL_CONFIG["model_name"],
+        model_name=args.model,
         num_classes=MODEL_CONFIG["num_classes"],
         dropout=MODEL_CONFIG["dropout"],
         pretrained=MODEL_CONFIG["pretrained"]
     )
     
-    print(f"\nModel architecture:")
-    print(model)
-    print(f"\nTotal parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
     # Create trainer
-    trainer = Trainer(model, train_loader, val_loader, device)
+    trainer = Trainer(model, args.model, train_loader, val_loader, device)
     
     # Train
-    history = trainer.train(num_epochs=TRAIN_CONFIG["num_epochs"])
-    
-    print("\n" + "="*60)
-    print("Training completed!")
-    print(f"Best validation accuracy: {trainer.best_val_acc:.4f}")
-    print(f"Best validation loss: {trainer.best_val_loss:.4f}")
-    print("="*60)
+    trainer.train(num_epochs=args.epochs)
 
 if __name__ == "__main__":
     main()
